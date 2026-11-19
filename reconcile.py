@@ -5,10 +5,15 @@ import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 
-NAVY, SLATE, LIGHT_NAVY = "1B365D", "2C5282", "EBF1F6"
+NAVY, SLATE = "1B365D", "2C5282"
 THIN = Side(style="thin", color="CBD5E0")
 BORDER = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 HKD_FMT = '"HK$"#,##0.00'
+
+KEY_HINTS = ("id", "inv", "ref", "doc", "record", "number", "no")
+KEY_EXCLUDE = ("date", "amount", "total", "hkd", "net", "price", "status", "state")
+AMOUNT_HINTS = ("amount", "total", "hkd", "net", "price", "value", "cost")
+STATUS_HINTS = ("status", "state", "approval", "settlement")
 
 
 def load_table(path: pathlib.Path, sheet=0) -> pd.DataFrame:
@@ -25,6 +30,33 @@ def load_table(path: pathlib.Path, sheet=0) -> pd.DataFrame:
     return df
 
 
+def resolve_column(
+    df: pd.DataFrame,
+    explicit: str | None,
+    hints: tuple[str, ...],
+    label: str,
+    exclude: tuple[str, ...] = ("date",),
+    required: bool = True,
+) -> str | None:
+    if explicit:
+        if explicit in df.columns:
+            return explicit
+        raise KeyError(
+            f"Column '{explicit}' not found in {label}. Available columns: {list(df.columns)}"
+        )
+
+    for col in df.columns:
+        low = col.lower()
+        if any(h in low for h in hints) and not any(ex in low for ex in exclude):
+            return col
+
+    if required:
+        raise KeyError(
+            f"Could not auto-detect column in {label}. Available columns: {list(df.columns)}"
+        )
+    return None
+
+
 def clean_amount(series: pd.Series) -> pd.Series:
     cleaned = (
         series.astype(str)
@@ -34,13 +66,6 @@ def clean_amount(series: pd.Series) -> pd.Series:
         .str.strip()
     )
     return pd.to_numeric(cleaned, errors="coerce").fillna(0.0)
-
-
-def validate_column(df: pd.DataFrame, col: str, label: str) -> None:
-    if col not in df.columns:
-        raise KeyError(
-            f"Column '{col}' not found in {label}. Available columns: {list(df.columns)}"
-        )
 
 
 def reconcile(
@@ -54,19 +79,8 @@ def reconcile(
     tgt_status: str | None = None,
     tolerance: float = 0.01,
 ) -> dict:
-    validate_column(src_df, src_key, "Source")
-    validate_column(src_df, src_amt, "Source")
-    validate_column(tgt_df, tgt_key, "Target")
-    validate_column(tgt_df, tgt_amt, "Target")
+    check_status = bool(src_status and tgt_status)
 
-    check_status = (
-        bool(src_status)
-        and bool(tgt_status)
-        and src_status in src_df.columns
-        and tgt_status in tgt_df.columns
-    )
-
-    # Normalize into standard internal columns so any header names/order work seamlessly
     s = pd.DataFrame({
         "Record_ID": src_df[src_key].astype(str).str.strip(),
         "Amount_HKD": clean_amount(src_df[src_amt]),
@@ -78,7 +92,6 @@ def reconcile(
         "Status": tgt_df[tgt_status].astype(str).str.strip() if check_status else "",
     })
 
-    # 1. Flag duplicates before 1-to-1 matching
     src_dups = s[s.duplicated(subset=["Record_ID"], keep=False)].assign(File_Origin="Source")
     tgt_dups = t[t.duplicated(subset=["Record_ID"], keep=False)].assign(File_Origin="Target")
     dups = pd.concat([src_dups, tgt_dups], ignore_index=True)
@@ -86,12 +99,10 @@ def reconcile(
     s_clean = s.drop_duplicates(subset=["Record_ID"], keep="first")
     t_clean = t.drop_duplicates(subset=["Record_ID"], keep="first")
 
-    # 2. Outer join on normalized Record_ID
     merged = pd.merge(
         s_clean, t_clean, on="Record_ID", how="outer", suffixes=("_Source", "_Target"), indicator=True
     )
 
-    # 3. Missing records
     missing_rows = []
     for _, r in merged[merged["_merge"] == "left_only"].iterrows():
         missing_rows.append({
@@ -108,7 +119,6 @@ def reconcile(
             "Status": r["Status_Target"],
         })
 
-    # 4. Discrepancies vs. exact matches
     disc_rows, match_rows = [], []
     for _, r in merged[merged["_merge"] == "both"].iterrows():
         s_val, t_val = float(r["Amount_HKD_Source"]), float(r["Amount_HKD_Target"])
@@ -176,43 +186,37 @@ def write_sheet(ws, title: str, df: pd.DataFrame) -> None:
 
 def main() -> None:
     base = pathlib.Path(__file__).resolve().parent
-    p = argparse.ArgumentParser(description="Reconcile two Excel/CSV files with flexible header mapping.")
+    p = argparse.ArgumentParser(description="Reconcile two Excel/CSV files with auto-detection or custom header mapping.")
     p.add_argument("--source", type=pathlib.Path, default=base / "sample_data" / "company_invoice_log.csv")
     p.add_argument("--target", type=pathlib.Path, default=base / "sample_data" / "vendor_statement.xlsx")
-    p.add_argument("--source-sheet", default=0, help="Source Excel sheet name or 0-based index")
-    p.add_argument("--target-sheet", default=0, help="Target Excel sheet name or 0-based index")
-
-    # Shared header shortcuts (used if both files share the same column names)
-    p.add_argument("--key", default="Invoice_ID", help="Shared ID column name")
-    p.add_argument("--amount-col", default="Amount_HKD", help="Shared amount column name")
-    p.add_argument("--status-col", default="Status", help="Shared status column name (optional)")
-
-    # Independent overrides when Source and Target use different header names
-    p.add_argument("--source-key", default=None, help="Source ID column name (overrides --key)")
-    p.add_argument("--target-key", default=None, help="Target ID column name (overrides --key)")
-    p.add_argument("--source-amount", default=None, help="Source amount column name (overrides --amount-col)")
-    p.add_argument("--target-amount", default=None, help="Target amount column name (overrides --amount-col)")
-    p.add_argument("--source-status", default=None, help="Source status column name (overrides --status-col)")
-    p.add_argument("--target-status", default=None, help="Target status column name (overrides --status-col)")
-
-    p.add_argument("--tolerance", type=float, default=0.01, help="Allowed rounding difference")
+    p.add_argument("--source-sheet", default=0)
+    p.add_argument("--target-sheet", default=0)
+    p.add_argument("--key", default=None)
+    p.add_argument("--amount-col", default=None)
+    p.add_argument("--status-col", default=None)
+    p.add_argument("--source-key", default=None)
+    p.add_argument("--target-key", default=None)
+    p.add_argument("--source-amount", default=None)
+    p.add_argument("--target-amount", default=None)
+    p.add_argument("--source-status", default=None)
+    p.add_argument("--target-status", default=None)
+    p.add_argument("--tolerance", type=float, default=0.01)
     p.add_argument("--output", type=pathlib.Path, default=base / "sample_output" / "reconciliation_report.xlsx")
     args = p.parse_args()
 
     src_df = load_table(args.source, sheet=args.source_sheet)
     tgt_df = load_table(args.target, sheet=args.target_sheet)
 
-    res = reconcile(
-        src_df=src_df,
-        tgt_df=tgt_df,
-        src_key=args.source_key or args.key,
-        tgt_key=args.target_key or args.key,
-        src_amt=args.source_amount or args.amount_col,
-        tgt_amt=args.target_amount or args.amount_col,
-        src_status=args.source_status or args.status_col,
-        tgt_status=args.target_status or args.status_col,
-        tolerance=args.tolerance,
-    )
+    src_key = resolve_column(src_df, args.source_key or args.key, KEY_HINTS, "Source", exclude=KEY_EXCLUDE)
+    tgt_key = resolve_column(tgt_df, args.target_key or args.key, KEY_HINTS, "Target", exclude=KEY_EXCLUDE)
+    src_amt = resolve_column(src_df, args.source_amount or args.amount_col, AMOUNT_HINTS, "Source")
+    tgt_amt = resolve_column(tgt_df, args.target_amount or args.amount_col, AMOUNT_HINTS, "Target")
+    src_st = resolve_column(src_df, args.source_status or args.status_col, STATUS_HINTS, "Source", required=False)
+    tgt_st = resolve_column(tgt_df, args.target_status or args.status_col, STATUS_HINTS, "Target", required=False)
+
+    print(f"Matched columns -> Key: [{src_key} vs {tgt_key}] | Amount: [{src_amt} vs {tgt_amt}] | Status: [{src_st} vs {tgt_st}]")
+
+    res = reconcile(src_df, tgt_df, src_key, tgt_key, src_amt, tgt_amt, src_st, tgt_st, tolerance=args.tolerance)
 
     wb = openpyxl.Workbook()
     summary_df = pd.DataFrame([
