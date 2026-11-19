@@ -1,6 +1,6 @@
 # Excel & CSV Data Reconciliation Checker
 
-A lightweight Python automation tool that compares two Excel (`.xlsx`) or CSV (`.csv`) datasets—such as an internal invoice ledger vs. a vendor statement, or an HR roster vs. a benefits/ORSO schedule—and generates a formatted, color-coded Excel exception report.
+A lightweight Python automation tool that compares two Excel (`.xlsx`) or CSV (`.csv`) datasets, such as an internal invoice ledger vs. a vendor statement, and generates a formatted, color-coded Excel exception report.
 
 ## Features
 - Supports `.csv` and `.xlsx` input files interchangeably
